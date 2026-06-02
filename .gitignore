@@ -14,6 +14,7 @@ Codes/dataset/oracles/*.npy
 
 # Generated subset data for smoke runs can be recreated.
 Codes/dataset/*_SMOKE/
+Codes/dataset/LIAR-RAW_SMALL*/
 
 # Local experiment outputs.
 outputs/
