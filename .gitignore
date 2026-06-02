@@ -1,0 +1,20 @@
+*.pt
+*.pth
+*.ckpt
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Large local datasets and generated artifacts.
+Codes/dataset/LIAR-RAW/*.json
+Codes/dataset/RAWFC/*.json
+Codes/dataset/logs/
+Codes/dataset/oracles/*.npy
+
+# Generated subset data for smoke runs can be recreated.
+Codes/dataset/*_SMOKE/
+
+# Local experiment outputs.
+outputs/
+runs/
