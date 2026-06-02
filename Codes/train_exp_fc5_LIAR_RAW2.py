@@ -53,10 +53,11 @@ torch.manual_seed(100)
 set_seed(100)
 
 REPORT_EACH_CLAIM = 30 #Totally retrive how many reprots for each claim
+REPORT_EACH_CLAIM = int(os.environ.get("COFCED_REPORT_EACH_CLAIM", REPORT_EACH_CLAIM))
 sent_dim = 768#384#768
 num_prerun = 1
 
-batch_size = 2
+batch_size = int(os.environ.get("COFCED_BATCH_SIZE", "2"))
 learning_rate = 1e-5 #0.0005#1e-3
 n_epochs = int(os.environ.get("COFCED_N_EPOCHS", "8"))#30
 EMBED_URL = "dataset/oracles/embeddings.npy"
@@ -77,6 +78,9 @@ LOG_DIR = os.environ.get("COFCED_LOG_DIR", pjoin(CODE_ROOT, "dataset", "logs"))
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = pjoin(LOG_DIR, f"{date_str}_DOC_ExplainFC5-DistilBERT_auto_{ROOT_PROJ_PATH.split('/')[-1]}2-all.log")
 SAVE_EACH_EPOCH = os.environ.get("COFCED_SAVE_EACH_EPOCH", "0") == "1"
+USE_FAC_FEATURES = os.environ.get("COFCED_USE_FAC_FEATURES", "0") == "1"
+TRAIN_LIMIT = int(os.environ.get("COFCED_TRAIN_LIMIT", "0"))
+SKIP_TEST = os.environ.get("COFCED_SKIP_TEST", "0") == "1"
 
 def to_np(x):
     if x == None:
@@ -158,6 +162,18 @@ def train_model(n_epochs=n_epochs,
     # lm_emb = DistilEmbeddings()
     # dataset = myDataset(filename, lm_emb, report_each_claim=REPORT_EACH_CLAIM)
     dataset = myDataset(filename, report_each_claim=REPORT_EACH_CLAIM)
+    if TRAIN_LIMIT > 0:
+        dataset.df = dataset.df[:TRAIN_LIMIT]
+        dataset.event_id = dataset.event_id[:TRAIN_LIMIT]
+        dataset.claim = dataset.claim[:TRAIN_LIMIT]
+        dataset.label = dataset.label[:TRAIN_LIMIT]
+        dataset.explain = dataset.explain[:TRAIN_LIMIT]
+        dataset.report_links = dataset.report_links[:TRAIN_LIMIT]
+        dataset.report_contents = dataset.report_contents[:TRAIN_LIMIT]
+        dataset.report_domains = dataset.report_domains[:TRAIN_LIMIT]
+        dataset.tok_sents = dataset.tok_sents[:TRAIN_LIMIT]
+        dataset.tok_sent_ids = dataset.tok_sent_ids[:TRAIN_LIMIT]
+        dataset._len = TRAIN_LIMIT
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.my_collate)
 
     model = ExplainFC(
@@ -173,11 +189,14 @@ def train_model(n_epochs=n_epochs,
         freeze = FREEZE_WV,
         max_doc_num=REPORT_EACH_CLAIM,#30，12
         vocab_article_source=None,#pjoin(ROOTPATH,vocab_article_source),
-        source_dim = source_dim
+        source_dim = source_dim,
+        use_fac_features=USE_FAC_FEATURES
     )
     # continue
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.logger.info("Welcome using %s", device)
+    log.logger.info("FaC-CofCED features enabled: %s", USE_FAC_FEATURES)
+    log.logger.info("Train limit: %d, batch size: %d, report_each_claim: %d", TRAIN_LIMIT, batch_size, REPORT_EACH_CLAIM)
 
     model = model.to(device)
     start_epoch = 0
@@ -350,12 +369,14 @@ def train_model(n_epochs=n_epochs,
         if cnt >= early_stop > 0:
             break
 
-    if test_file and best_model_url:
+    if test_file and best_model_url and not SKIP_TEST:
         best_model = torch.load(best_model_url)
         log.logger.info("best model url: %s", best_model_url)
         log.logger.info("evaluating on test dataset: %s", test_file)
         tese_precision, test_recall, test_micf1, test_macrof, test_rouges, test_p_sent, test_r_sent, test_f1_sent = evaluate_model(best_model, pjoin(ROOT_PROJ_PATH, test_file), saved_model, log=log, report_each_claim=REPORT_EACH_CLAIM).values()
         log.logger.info("results on the test set: P %6f, R %6f, micF %6f, macF %6f.\n P_sent %6f, R_sent %6f, macF_sent %6f.\n  Finished!" % (tese_precision, test_recall, test_micf1, test_macrof, test_p_sent, test_r_sent, test_f1_sent))
+    elif test_file and SKIP_TEST:
+        log.logger.info("COFCED_SKIP_TEST=1; skip test evaluation.")
     elif test_file:
         log.logger.warning("No new best model was produced; skip test evaluation.")
     log.logger.info(arguments)

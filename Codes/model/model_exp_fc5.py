@@ -41,12 +41,14 @@ MAX_ORACLE= 55 # 最多的oracle的句子数
 
 class ExplainFC(nn.Module):
     def __init__(self, hidden_size, n_tags, embedding_url=None, bidirectional=True, lstm_layers=1,
-                 n_embeddings=None, embedding_dim=None, lm_embedding_dim = 76800, freeze=False, char_feat_dim=0, max_doc_num=12, vocab_article_source=None, source_dim=20, bert_model_or_path='distilbert-base-uncased'):
+                 n_embeddings=None, embedding_dim=None, lm_embedding_dim = 76800, freeze=False, char_feat_dim=0, max_doc_num=12, vocab_article_source=None, source_dim=20, bert_model_or_path='distilbert-base-uncased', use_fac_features=False):
         super(ExplainFC, self).__init__()
         self.device = torch.device("cuda" if (torch.cuda.is_available()) else "cpu")
         self.max_doc_num = max_doc_num
+        self.use_fac_features = use_fac_features
         # self.config = RobertaConfig.from_pretrained(bert_model_or_path)
-        self.bert_embedding = DistilBertModel.from_pretrained(bert_model_or_path).to(self.device)##'distilbert-base-uncased'
+        local_only = os.environ.get("COFCED_TRANSFORMERS_LOCAL_ONLY", "0") == "1"
+        self.bert_embedding = DistilBertModel.from_pretrained(bert_model_or_path, local_files_only=local_only).to(self.device)##'distilbert-base-uncased'
         # self.bert_embedding = RobertaModel.from_pretrained(bert_model_or_path, config=self.config).to(self.device)##may cause OOV   'distilroberta-base'
 
         # if embedding_url:
@@ -208,6 +210,10 @@ class ExplainFC(nn.Module):
         )
 
         self.content_layer = nn.Linear(self.n_hidden, 1)
+        if self.use_fac_features:
+            self.fac_selector = nn.Linear(5, 1)
+            self.fac_repr_gate = nn.Linear(5, 3)
+            self.fac_classifier = FeedForward(input_dim=self.n_hidden*6, hidden_size=self.n_hidden, num_classes=n_tags, dropout_rate=0.2)
 
     def gen_batch_info(self, word_repr, num_sents, sent_lengths):
         '''
@@ -472,6 +478,7 @@ class ExplainFC(nn.Module):
 
         # 文档包含的真实句子数量 按照文档分开
         src_sent_num = lm_ids_dict['src_sent_num'] # sents in each doc for a given claim
+        fac_features = lm_ids_dict.get('fac_features') if self.use_fac_features else None
         src_doc_num = [sum(nums) for nums in src_sent_num] # total sent num in each doc for a given claim         
 
         # for each claim: if batch>1
@@ -519,16 +526,24 @@ class ExplainFC(nn.Module):
             # sel_s_repr = torch.vstack([pad_s_repr[i] for i in _indices]) # (TOP_N_DOC*max_num, 768)
             sel_s_repr = pad_sequence([pad_s_repr[i] for i in _indices], batch_first=True) # (TOP_N_DOC, max_num, 768)
             sel_s_mask = pad_sequence([_mask[i] for i in _indices], batch_first=True) # (TOP_N_DOC, max_num)
+            sel_fac_features = None
+            if self.use_fac_features and fac_features is not None:
+                sel_fac_features = pad_sequence([fac_features[i][doc_idx] for doc_idx in _indices], batch_first=True).to(self.device)
             selected_sent_repr_mask.append(sel_s_mask)
 
             h_reduncy = torch.zeros(sel_s_repr.shape[-1]).to(self.device)
 
             # 2: select evidence sents: redundancy 循环TOP_N_DOC次
-            for doc_repr, s_repr, s_mask in zip(s_unpacked, sel_s_repr, sel_s_mask):
+            selected_fac_features = []
+            selected_fac_sent_repr = []
+            for doc_pos, (doc_repr, s_repr, s_mask) in enumerate(zip(s_unpacked, sel_s_repr, sel_s_mask)):
                 '''doc_repr(1,768)文档表示; pad_c_repr (1,768), s_repr(13, 768), s_mask (13)'''
                 threshhold = 1.0/sum(s_mask) if sum(s_mask) > 1 else 1.0/2  # total_n_sents
                 batch_sel_thresholds[i].append(threshhold)
                 s_mask = 1 - s_mask
+                doc_fac = None
+                if self.use_fac_features and sel_fac_features is not None:
+                    doc_fac = sel_fac_features[doc_pos, :s_repr.shape[0]]
                 # 1) claim-relevance, topic
                 claim_scores = torch.matmul(torch.matmul(s_repr.masked_fill(s_mask.unsqueeze(1) == 1, -1e9), self.params['doc_sent_att_w']), pad_c_repr.squeeze(0)) / math.sqrt(s_repr.shape[-1])#N_doc
                 # claim_att_weights = F.softmax(claim_scores, dim=-1) # weights for each sent in a report doc
@@ -547,6 +562,9 @@ class ExplainFC(nn.Module):
 
                 # total_weights = claim_att_weights+doc_att_weights #+content_att_weights
                 total_weights = claim_scores + doc_scores + content_scores - red_scores #+content_att_weights
+                if self.use_fac_features and doc_fac is not None:
+                    fac_scores = self.fac_selector(doc_fac).squeeze(-1)
+                    total_weights = total_weights + fac_scores
                 pre_prob = self.sigmoid(total_weights) # .masked_fill(s_mask == 1, -1e9)
                 # probability of choosing evidence for each batch
                 evi_logits[i].append(pre_prob)
@@ -580,6 +598,9 @@ class ExplainFC(nn.Module):
                 # selected_sent_repr = torch.vstack([evi_repr[ind] for ind in ind_list[:_end]] )
                 for ind in ind_list[:_end]:
                     selected_sent_repr.append(evi_repr[ind])
+                    if self.use_fac_features and doc_fac is not None:
+                        selected_fac_sent_repr.append(evi_repr[ind])
+                        selected_fac_features.append(doc_fac[ind])
                     # selected_sent_repr_mask.append((1-s_mask)[ind])
                 # sent reprs
                 # evi_sents[i].append(evi_repr)
@@ -596,10 +617,27 @@ class ExplainFC(nn.Module):
             pool_sent_repr = torch.max(doc_sent_repr, dim=0, keepdim=True)[0]
             pool_src_repr = torch.max(s_unpacked, dim=0, keepdim=True)[0]
 
-            rich_repr = torch.cat([pad_c_repr, self.dropout_layer(pool_sent_repr), self.dropout_layer(pool_src_repr)], dim=-1)
+            if self.use_fac_features and selected_fac_features and selected_fac_sent_repr:
+                doc_sent_repr = torch.vstack(selected_fac_sent_repr)
+                selected_fac_tensor = torch.vstack(selected_fac_features).to(self.device)
+                stance_weights = torch.softmax(self.fac_repr_gate(selected_fac_tensor), dim=0)
+                support_repr = torch.sum(doc_sent_repr * stance_weights[:, 0].unsqueeze(-1), dim=0, keepdim=True)
+                refute_repr = torch.sum(doc_sent_repr * stance_weights[:, 1].unsqueeze(-1), dim=0, keepdim=True)
+                conflict_repr = torch.sum(doc_sent_repr * stance_weights[:, 2].unsqueeze(-1), dim=0, keepdim=True)
+                rich_repr = torch.cat([
+                    pad_c_repr,
+                    self.dropout_layer(pool_src_repr),
+                    self.dropout_layer(pool_sent_repr),
+                    self.dropout_layer(support_repr),
+                    self.dropout_layer(refute_repr),
+                    self.dropout_layer(conflict_repr)
+                ], dim=-1)
+                ver = self.fac_classifier(rich_repr)
+            else:
+                rich_repr = torch.cat([pad_c_repr, self.dropout_layer(pool_sent_repr), self.dropout_layer(pool_src_repr)], dim=-1)
+                ver = self.classifier3(rich_repr)
 
             # task 2
-            ver = self.classifier3(rich_repr)
             veracity.append(ver)
 
         veracity = torch.vstack(veracity)
@@ -645,9 +683,6 @@ class FeedForward(nn.Module):
         out = self.fc2(out)
 
         return out
-
-
-
 
 
 

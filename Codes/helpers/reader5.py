@@ -15,6 +15,8 @@ import helpers.json_util as ju
 
 from tqdm import tqdm
 import pickle
+import math
+import re
 
 # from helpers.lm_embeddings import data2ids, list2str
 import sys
@@ -56,6 +58,79 @@ else:
 
 TOP_K_ORACLE_NUMS = 5#prepare 5 FOR PUB_ORACLE , 5 FOR LIAR-PLUS
 
+FAC_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has",
+    "have", "he", "in", "is", "it", "its", "of", "on", "or", "she", "that",
+    "the", "their", "them", "there", "they", "this", "to", "was", "were",
+    "will", "with", "would"
+}
+FAC_REFUTE_CUES = {
+    "false", "fake", "hoax", "incorrect", "misleading", "myth", "not", "no",
+    "never", "deny", "denied", "denies", "refute", "refuted", "debunk",
+    "debunked", "rumor", "rumour", "fabricated", "wrong", "cannot", "can't",
+    "didn't", "doesn't", "isn't", "aren't", "wasn't", "weren't"
+}
+FAC_SUPPORT_CUES = {
+    "accurate", "confirm", "confirmed", "confirms", "evidence", "found",
+    "official", "prove", "proved", "proves", "report", "reported", "says",
+    "show", "showed", "shows", "true", "verify", "verified"
+}
+
+
+def _fac_tokens(text):
+    return [
+        tok for tok in re.findall(r"[a-z0-9']+", str(text).lower())
+        if tok and tok not in FAC_STOPWORDS
+    ]
+
+
+def _fac_alignment(claim_tokens, sent_tokens):
+    if not claim_tokens or not sent_tokens:
+        return 0.0
+    cset, sset = set(claim_tokens), set(sent_tokens)
+    overlap = len(cset & sset)
+    return overlap / math.sqrt(max(len(cset), 1) * max(len(sset), 1))
+
+
+def _fac_stance_features(claim, sentence):
+    """Cheap, deterministic proxy for fact alignment and stance.
+
+    The feature layout is:
+    [alignment, support_proxy, refute_proxy, neutral_proxy, conflict_proxy].
+    It is intentionally replaceable by offline NLI/embedding features later.
+    """
+    claim_tokens = _fac_tokens(claim)
+    sent_tokens = _fac_tokens(sentence)
+    alignment = _fac_alignment(claim_tokens, sent_tokens)
+    token_set = set(sent_tokens)
+    refute_cue = float(bool(token_set & FAC_REFUTE_CUES))
+    support_cue = float(bool(token_set & FAC_SUPPORT_CUES))
+
+    refute = min(1.0, alignment * (0.35 + 0.65 * refute_cue))
+    support = min(1.0, alignment * (0.25 + 0.55 * support_cue))
+    if refute_cue and support_cue:
+        conflict = min(1.0, alignment * 0.75)
+    else:
+        conflict = min(support, refute)
+    neutral = max(0.0, 1.0 - max(support, refute, alignment * 0.5))
+    return [alignment, support, refute, neutral, conflict]
+
+
+def gen_fac_features(claims, report_sents, device):
+    fac_features = []
+    for claim, claim_reports in zip(claims, report_sents):
+        doc_features = []
+        max_sents = max([len(doc) for doc in claim_reports], default=1)
+        for doc in claim_reports:
+            sent_features = [_fac_stance_features(claim, sent) for sent in doc]
+            sent_features.extend([[0.0] * 5 for _ in range(max_sents - len(sent_features))])
+            doc_features.append(torch.FloatTensor(sent_features))
+        if doc_features:
+            fac_features.append(torch.stack(doc_features).to(device))
+        else:
+            fac_features.append(torch.zeros(1, max_sents, 5, device=device))
+    return fac_features
+
 class myDataset(Dataset):
     # def __init__(self, data_file, lm_emb, report_each_claim=30):
     def __init__(self, data_file, report_each_claim=30):
@@ -71,7 +146,8 @@ class myDataset(Dataset):
         # self.lm_emb = PreEmbeddedLM(f'./dataset/oracles/albert.emb.pkl')
         # self.lm_emb = DistilEmbeddings() #SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
-        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')#("bert-base-uncased")
+        local_only = os.environ.get("COFCED_TRANSFORMERS_LOCAL_ONLY", "0") == "1"
+        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', local_files_only=local_only)#("bert-base-uncased")
         # self.embedding_cache_path = from_project_root(ROOT_PROJ_PATH+"/pub.emb.pkl")##.format(dataset)
         # self.dataset = self.generate_beans(self.df)
         # self._x, self._justs, self._y = self.generate_beans(self.df)
@@ -254,6 +330,7 @@ class myDataset(Dataset):
         lm_ids_dict['src_sent_num'] = [[len(reports) for reports in claims] for claims in raw_data_list[7]]        
         lm_ids_dict['num_oracle_eachdoc'] = num_oracle_eachdoc
         lm_ids_dict['report_domains'] = gen_domain_id(raw_data_list[6], device=_device)
+        lm_ids_dict['fac_features'] = gen_fac_features(raw_data_list[1], raw_data_list[7], device=_device)
         # lm_ids_dict['report_domains_ids'] = []
 
         max_length = cal_max_word_num(raw_data_list)

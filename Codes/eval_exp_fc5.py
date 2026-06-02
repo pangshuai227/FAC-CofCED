@@ -260,11 +260,14 @@ def evaluate_model(model, data_url, bsl_model=None, criterion=None, sent_criteri
         log.logger.info(f'P_sent: {precision_sent}, R_sent: {recall_sent}, F1_sent: {f1_sent}')
 
         # veracity
+        claim_labels = list(range(len(LABEL_IDS)))
         macrof = classification_report(claim_true_list, claim_pred_list,
+                              labels=claim_labels,
                               target_names=get_label_list(LABEL_IDS),
                               digits=6).split('\n')[-3].split()[-2]
 
         log.logger.info("claim classification result:\n %s", classification_report(claim_true_list, claim_pred_list,
+                                    labels=claim_labels,
                                     target_names=get_label_list(LABEL_IDS), digits=6))
 
         ret = dict()
