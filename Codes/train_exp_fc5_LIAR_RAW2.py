@@ -79,6 +79,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = pjoin(LOG_DIR, f"{date_str}_DOC_ExplainFC5-DistilBERT_auto_{ROOT_PROJ_PATH.split('/')[-1]}2-all.log")
 SAVE_EACH_EPOCH = os.environ.get("COFCED_SAVE_EACH_EPOCH", "0") == "1"
 USE_FAC_FEATURES = os.environ.get("COFCED_USE_FAC_FEATURES", "0") == "1"
+FAC_VERSION = int(os.environ.get("COFCED_FAC_VERSION", "1"))
 TRAIN_LIMIT = int(os.environ.get("COFCED_TRAIN_LIMIT", "0"))
 SKIP_TEST = os.environ.get("COFCED_SKIP_TEST", "0") == "1"
 
@@ -190,12 +191,14 @@ def train_model(n_epochs=n_epochs,
         max_doc_num=REPORT_EACH_CLAIM,#30，12
         vocab_article_source=None,#pjoin(ROOTPATH,vocab_article_source),
         source_dim = source_dim,
-        use_fac_features=USE_FAC_FEATURES
+        use_fac_features=USE_FAC_FEATURES,
+        fac_version=FAC_VERSION
     )
     # continue
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.logger.info("Welcome using %s", device)
     log.logger.info("FaC-CofCED features enabled: %s", USE_FAC_FEATURES)
+    log.logger.info("FaC-CofCED version: %d", FAC_VERSION)
     log.logger.info("Train limit: %d, batch size: %d, report_each_claim: %d", TRAIN_LIMIT, batch_size, REPORT_EACH_CLAIM)
 
     model = model.to(device)

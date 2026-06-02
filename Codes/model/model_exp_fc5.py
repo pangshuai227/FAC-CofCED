@@ -41,11 +41,18 @@ MAX_ORACLE= 55 # 最多的oracle的句子数
 
 class ExplainFC(nn.Module):
     def __init__(self, hidden_size, n_tags, embedding_url=None, bidirectional=True, lstm_layers=1,
-                 n_embeddings=None, embedding_dim=None, lm_embedding_dim = 76800, freeze=False, char_feat_dim=0, max_doc_num=12, vocab_article_source=None, source_dim=20, bert_model_or_path='distilbert-base-uncased', use_fac_features=False):
+                 n_embeddings=None, embedding_dim=None, lm_embedding_dim = 76800, freeze=False, char_feat_dim=0, max_doc_num=12, vocab_article_source=None, source_dim=20, bert_model_or_path='distilbert-base-uncased', use_fac_features=False, fac_version=1):
         super(ExplainFC, self).__init__()
         self.device = torch.device("cuda" if (torch.cuda.is_available()) else "cpu")
         self.max_doc_num = max_doc_num
         self.use_fac_features = use_fac_features
+        self.fac_version = fac_version
+        selector_default = "0.20" if fac_version >= 3 else "0.75"
+        logit_default = "0.03" if fac_version >= 4 else ("0.08" if fac_version >= 3 else "0.35")
+        residual_default = "0.15" if fac_version >= 4 else ("0.25" if fac_version >= 3 else "1.00")
+        self.fac_selector_scale = float(os.environ.get("COFCED_FAC_SELECTOR_SCALE", selector_default))
+        self.fac_logit_scale = float(os.environ.get("COFCED_FAC_LOGIT_SCALE", logit_default))
+        self.fac_residual_scale = float(os.environ.get("COFCED_FAC_RESIDUAL_SCALE", residual_default))
         # self.config = RobertaConfig.from_pretrained(bert_model_or_path)
         local_only = os.environ.get("COFCED_TRANSFORMERS_LOCAL_ONLY", "0") == "1"
         self.bert_embedding = DistilBertModel.from_pretrained(bert_model_or_path, local_files_only=local_only).to(self.device)##'distilbert-base-uncased'
@@ -214,6 +221,47 @@ class ExplainFC(nn.Module):
             self.fac_selector = nn.Linear(5, 1)
             self.fac_repr_gate = nn.Linear(5, 3)
             self.fac_classifier = FeedForward(input_dim=self.n_hidden*6, hidden_size=self.n_hidden, num_classes=n_tags, dropout_rate=0.2)
+            self.fac_summary_classifier = FeedForward(input_dim=self.n_hidden*6 + 8, hidden_size=self.n_hidden, num_classes=n_tags, dropout_rate=0.2)
+
+    def fac_pool(self, sent_repr, fac_tensor, column):
+        weights = fac_tensor[:, column].clamp(min=0.0)
+        if torch.sum(weights) <= 1e-6:
+            weights = torch.ones_like(weights)
+        weights = weights / torch.sum(weights)
+        return torch.sum(sent_repr * weights.unsqueeze(-1), dim=0, keepdim=True)
+
+    def fac_summary_features(self, fac_tensor):
+        support = fac_tensor[:, 1]
+        refute = fac_tensor[:, 2]
+        neutral = fac_tensor[:, 3]
+        conflict = fac_tensor[:, 4]
+        return torch.stack([
+            fac_tensor[:, 0].mean(),
+            support.mean(),
+            refute.mean(),
+            neutral.mean(),
+            conflict.mean(),
+            torch.max(refute) if len(refute) else torch.tensor(0.0, device=self.device),
+            torch.max(support) if len(support) else torch.tensor(0.0, device=self.device),
+            (refute.mean() - support.mean())
+        ]).view(1, -1).to(self.device)
+
+    def fac_label_prior(self, fac_summary):
+        """Map support/refute balance into LIAR's ordered six-class logits."""
+        prior = torch.zeros(1, self.n_tags, device=self.device)
+        if self.n_tags != 6:
+            return prior
+        support = fac_summary[0, 1]
+        refute = fac_summary[0, 2]
+        conflict = fac_summary[0, 4]
+        balance = refute - support
+        prior[0, 0] = 1.30 * balance + 0.30 * conflict
+        prior[0, 1] = 1.00 * balance + 0.20 * conflict
+        prior[0, 2] = 0.45 * balance + 0.25 * conflict
+        prior[0, 3] = 0.20 * conflict
+        prior[0, 4] = -0.45 * balance
+        prior[0, 5] = -1.00 * balance
+        return prior
 
     def gen_batch_info(self, word_repr, num_sents, sent_lengths):
         '''
@@ -563,7 +611,28 @@ class ExplainFC(nn.Module):
                 # total_weights = claim_att_weights+doc_att_weights #+content_att_weights
                 total_weights = claim_scores + doc_scores + content_scores - red_scores #+content_att_weights
                 if self.use_fac_features and doc_fac is not None:
-                    fac_scores = self.fac_selector(doc_fac).squeeze(-1)
+                    if self.fac_version >= 4:
+                        fac_scores = self.fac_selector(doc_fac).squeeze(-1)
+                    elif self.fac_version >= 3:
+                        raw_fac_scores = (
+                            doc_fac[:, 0]
+                            + 0.50 * torch.maximum(doc_fac[:, 1], doc_fac[:, 2])
+                            + 0.20 * doc_fac[:, 4]
+                            - 0.10 * doc_fac[:, 3]
+                        )
+                        valid_fac_scores = raw_fac_scores[s_mask == 0]
+                        if valid_fac_scores.numel() > 0:
+                            raw_fac_scores = raw_fac_scores - valid_fac_scores.mean()
+                        fac_scores = raw_fac_scores * self.fac_selector_scale
+                    elif self.fac_version >= 2:
+                        fac_scores = (
+                            doc_fac[:, 0]
+                            + 0.60 * torch.maximum(doc_fac[:, 1], doc_fac[:, 2])
+                            + 0.35 * doc_fac[:, 4]
+                            - 0.20 * doc_fac[:, 3]
+                        ) * self.fac_selector_scale
+                    else:
+                        fac_scores = self.fac_selector(doc_fac).squeeze(-1)
                     total_weights = total_weights + fac_scores
                 pre_prob = self.sigmoid(total_weights) # .masked_fill(s_mask == 1, -1e9)
                 # probability of choosing evidence for each batch
@@ -616,26 +685,78 @@ class ExplainFC(nn.Module):
             doc_sent_repr = torch.vstack(selected_sent_repr) 
             pool_sent_repr = torch.max(doc_sent_repr, dim=0, keepdim=True)[0]
             pool_src_repr = torch.max(s_unpacked, dim=0, keepdim=True)[0]
+            base_repr = torch.cat([pad_c_repr, self.dropout_layer(pool_sent_repr), self.dropout_layer(pool_src_repr)], dim=-1)
+            base_ver = self.classifier3(base_repr)
 
             if self.use_fac_features and selected_fac_features and selected_fac_sent_repr:
                 doc_sent_repr = torch.vstack(selected_fac_sent_repr)
                 selected_fac_tensor = torch.vstack(selected_fac_features).to(self.device)
-                stance_weights = torch.softmax(self.fac_repr_gate(selected_fac_tensor), dim=0)
-                support_repr = torch.sum(doc_sent_repr * stance_weights[:, 0].unsqueeze(-1), dim=0, keepdim=True)
-                refute_repr = torch.sum(doc_sent_repr * stance_weights[:, 1].unsqueeze(-1), dim=0, keepdim=True)
-                conflict_repr = torch.sum(doc_sent_repr * stance_weights[:, 2].unsqueeze(-1), dim=0, keepdim=True)
-                rich_repr = torch.cat([
-                    pad_c_repr,
-                    self.dropout_layer(pool_src_repr),
-                    self.dropout_layer(pool_sent_repr),
-                    self.dropout_layer(support_repr),
-                    self.dropout_layer(refute_repr),
-                    self.dropout_layer(conflict_repr)
-                ], dim=-1)
-                ver = self.fac_classifier(rich_repr)
+                if self.fac_version >= 4:
+                    stance_weights = torch.softmax(self.fac_repr_gate(selected_fac_tensor), dim=0)
+                    support_repr = torch.sum(doc_sent_repr * stance_weights[:, 0].unsqueeze(-1), dim=0, keepdim=True)
+                    refute_repr = torch.sum(doc_sent_repr * stance_weights[:, 1].unsqueeze(-1), dim=0, keepdim=True)
+                    conflict_repr = torch.sum(doc_sent_repr * stance_weights[:, 2].unsqueeze(-1), dim=0, keepdim=True)
+                    fac_summary = self.fac_summary_features(selected_fac_tensor)
+                    rich_repr = torch.cat([
+                        pad_c_repr,
+                        self.dropout_layer(pool_src_repr),
+                        self.dropout_layer(pool_sent_repr),
+                        self.dropout_layer(support_repr),
+                        self.dropout_layer(refute_repr),
+                        self.dropout_layer(conflict_repr)
+                    ], dim=-1)
+                    ver = self.fac_classifier(rich_repr)
+                    ver = ver + self.fac_residual_scale * self.fac_summary_classifier(torch.cat([rich_repr, fac_summary], dim=-1))
+                    ver = ver + self.fac_logit_scale * self.fac_label_prior(fac_summary)
+                elif self.fac_version >= 3:
+                    support_repr = self.fac_pool(doc_sent_repr, selected_fac_tensor, 1)
+                    refute_repr = self.fac_pool(doc_sent_repr, selected_fac_tensor, 2)
+                    conflict_repr = self.fac_pool(doc_sent_repr, selected_fac_tensor, 4)
+                    fac_summary = self.fac_summary_features(selected_fac_tensor)
+                    rich_repr = torch.cat([
+                        pad_c_repr,
+                        self.dropout_layer(pool_src_repr),
+                        self.dropout_layer(pool_sent_repr),
+                        self.dropout_layer(support_repr),
+                        self.dropout_layer(refute_repr),
+                        self.dropout_layer(conflict_repr)
+                    ], dim=-1)
+                    fac_ver = self.fac_summary_classifier(torch.cat([rich_repr, fac_summary], dim=-1))
+                    ver = base_ver + self.fac_residual_scale * fac_ver
+                    ver = ver + self.fac_logit_scale * self.fac_label_prior(fac_summary)
+                    ver = 0.50 * ver + 0.50 * self.fac_classifier(rich_repr)
+                elif self.fac_version >= 2:
+                    support_repr = self.fac_pool(doc_sent_repr, selected_fac_tensor, 1)
+                    refute_repr = self.fac_pool(doc_sent_repr, selected_fac_tensor, 2)
+                    conflict_repr = self.fac_pool(doc_sent_repr, selected_fac_tensor, 4)
+                    fac_summary = self.fac_summary_features(selected_fac_tensor)
+                    rich_repr = torch.cat([
+                        pad_c_repr,
+                        self.dropout_layer(pool_src_repr),
+                        self.dropout_layer(pool_sent_repr),
+                        self.dropout_layer(support_repr),
+                        self.dropout_layer(refute_repr),
+                        self.dropout_layer(conflict_repr)
+                    ], dim=-1)
+                    ver = self.fac_summary_classifier(torch.cat([rich_repr, fac_summary], dim=-1))
+                    ver = ver + self.fac_logit_scale * self.fac_label_prior(fac_summary)
+                else:
+                    stance_weights = torch.softmax(self.fac_repr_gate(selected_fac_tensor), dim=0)
+                    support_repr = torch.sum(doc_sent_repr * stance_weights[:, 0].unsqueeze(-1), dim=0, keepdim=True)
+                    refute_repr = torch.sum(doc_sent_repr * stance_weights[:, 1].unsqueeze(-1), dim=0, keepdim=True)
+                    conflict_repr = torch.sum(doc_sent_repr * stance_weights[:, 2].unsqueeze(-1), dim=0, keepdim=True)
+                    fac_summary = None
+                    rich_repr = torch.cat([
+                        pad_c_repr,
+                        self.dropout_layer(pool_src_repr),
+                        self.dropout_layer(pool_sent_repr),
+                        self.dropout_layer(support_repr),
+                        self.dropout_layer(refute_repr),
+                        self.dropout_layer(conflict_repr)
+                    ], dim=-1)
+                    ver = self.fac_classifier(rich_repr)
             else:
-                rich_repr = torch.cat([pad_c_repr, self.dropout_layer(pool_sent_repr), self.dropout_layer(pool_src_repr)], dim=-1)
-                ver = self.classifier3(rich_repr)
+                ver = base_ver
 
             # task 2
             veracity.append(ver)
@@ -683,7 +804,4 @@ class FeedForward(nn.Module):
         out = self.fc2(out)
 
         return out
-
-
-
 
