@@ -43,8 +43,8 @@ def setup_style():
         "axes.linewidth": 1.0,
         "axes.grid": True,
         "grid.color": "#E5E7EB",
-        "grid.linewidth": 0.8,
-        "grid.alpha": 1.0,
+        "grid.linewidth": 0.6,
+        "grid.alpha": 0.35,
     })
 
 

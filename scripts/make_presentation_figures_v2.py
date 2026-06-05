@@ -40,7 +40,8 @@ def setup_style():
         "axes.edgecolor": "#D0D7DE",
         "axes.grid": True,
         "grid.color": "#E9EDF2",
-        "grid.linewidth": 0.8,
+        "grid.linewidth": 0.55,
+        "grid.alpha": 0.28,
     })
 
 
@@ -80,41 +81,50 @@ def plot_core_results_cn():
 
 
 def plot_gain_focus():
-    # Absolute deltas, emphasizing the gains we care most about for class presentation.
-    labels = ["Test Accuracy\n/ Micro-F1", "Test Macro-F1", "ROUGE-1", "ROUGE-2", "ROUGE-L"]
-    gains = [0.024781, 0.022005, 0.0010, 0.0002, 0.0007]
+    # Keep only the gains worth highlighting on a class presentation slide.
+    labels = ["Accuracy /\nMicro-F1", "Macro-F1", "Sentence-level\nselection"]
+    gains = [0.024781, 0.022005, -0.025505]
+    colors = [COLORS["green"], COLORS["orange"], COLORS["red"]]
 
-    fig, ax = plt.subplots(figsize=(11.5, 6.2))
-    bars = ax.bar(labels, gains, color=[COLORS["green"], COLORS["green"], COLORS["gold"], COLORS["gold"], COLORS["gold"]], width=0.58)
+    fig, ax = plt.subplots(figsize=(9.8, 6.0))
+    bars = ax.bar(labels, gains, color=colors, width=0.52)
+    ax.axhline(0, color=COLORS["dark"], linewidth=1.1)
     for bar, val in zip(bars, gains):
-        ax.text(bar.get_x() + bar.get_width() / 2, val + 0.0007, f"{val:.4f}", ha="center", va="bottom", fontsize=10)
+        if val >= 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, val + 0.0012, f"+{val:.4f}", ha="center", va="bottom", fontsize=12)
+        else:
+            ax.text(bar.get_x() + bar.get_width() / 2, val - 0.0022, f"{val:.4f}", ha="center", va="top", fontsize=12)
 
-    ax.set_title("Performance Gains of FaC-CofCED v1")
+    ax.set_title("What Improved Most")
     ax.set_ylabel("Absolute gain")
-    ax.set_ylim(0, 0.03)
+    ax.set_ylim(-0.035, 0.03)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     savefig(fig, "02_performance_gains_v2.png")
 
 
 def plot_class_delta_cn():
-    # Class-wise F1 changes.
-    labels = ["pants-fire", "false", "barely-true", "half-true", "mostly-true", "true"]
-    deltas = [0.015292, -0.022371, -0.008664, 0.077752, 0.075296, -0.005272]
-    colors = [COLORS["green"] if v >= 0 else COLORS["red"] for v in deltas]
+    # Highlight only the most presentation-worthy class gains.
+    labels = ["half-true", "mostly-true", "pants-fire"]
+    deltas = [0.077752, 0.075296, 0.015292]
+    base_f1 = [0.210300, 0.251627, 0.208589]
+    new_f1 = [0.288052, 0.326923, 0.223881]
 
-    fig, ax = plt.subplots(figsize=(12, 6.5))
-    bars = ax.bar(labels, deltas, color=colors, width=0.6)
-    ax.axhline(0, color=COLORS["dark"], linewidth=1.2)
+    y = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(10.5, 6.2))
+    ax.barh(y, base_f1, color="#D7E3F3", edgecolor="none", height=0.52, label="CofCED")
+    ax.barh(y, new_f1, color=COLORS["orange"], edgecolor="none", height=0.34, label="FaC-CofCED v1")
 
-    for bar, val in zip(bars, deltas):
-        y = val + (0.004 if val >= 0 else -0.006)
-        va = "bottom" if val >= 0 else "top"
-        ax.text(bar.get_x() + bar.get_width() / 2, y, f"{val:+.3f}", ha="center", va=va, fontsize=10)
+    for yi, base, new, delta in zip(y, base_f1, new_f1, deltas):
+        ax.text(new + 0.006, yi, f"+{delta:.3f}", va="center", ha="left", fontsize=11, color=COLORS["dark"])
 
-    ax.set_title("Class-wise F1 Changes")
-    ax.set_ylabel("FaC-CofCED v1 - CofCED")
-    ax.set_ylim(-0.04, 0.09)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_title("Largest Class-wise Gains")
+    ax.set_xlabel("F1-score")
+    ax.set_xlim(0, 0.38)
+    ax.legend(frameon=False, loc="lower right")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     savefig(fig, "03_class_f1_changes_v2.png")
